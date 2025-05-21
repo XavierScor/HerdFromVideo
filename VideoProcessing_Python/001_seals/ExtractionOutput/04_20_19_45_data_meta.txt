@@ -1,0 +1,2 @@
+Resolution 20
+GroundSize 61.2
