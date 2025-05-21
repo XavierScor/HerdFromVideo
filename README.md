@@ -17,3 +17,6 @@ Please process video in following steps:
 Implemented with unity and C#.
 
 Graphic card is required for acceleration.
+
+## Copyright
+Videos used in this project were obtained from online sources. All rights and copyrights belong to the original creators. If you own the copyright to any video used here and object to its inclusion, please contact us at [xianjin.gong@ip-paris.fr], and we will remove it immediately.
