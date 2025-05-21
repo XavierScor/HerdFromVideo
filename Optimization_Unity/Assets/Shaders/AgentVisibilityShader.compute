@@ -1,0 +1,318 @@
+#pragma kernel CSMain
+
+struct AgentGPU
+{
+    float3 position;
+    float3 forward;
+    float3 up;
+    
+    float perceptionRadius;
+    float capsuleHeight;
+    float capsuleRadius;
+};
+
+struct Cube
+{
+    float4x4 worldToLocal;
+    float4x4 localtoWorld;
+    float3 halfSize;
+};
+
+struct Capsule
+{
+    float3 centerA;
+    float3 centerB;
+    float radius;
+};
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+struct RayHit
+{
+    float3 position;
+    float distance;
+    float3 normal;
+};
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = float3(0.0f, 0.0f, 0.0f);
+    hit.distance = 1.#INF;
+    hit.normal = float3(0.0f, 0.0f, 0.0f);
+    return hit;
+}
+
+float3 CapsuleNormal(float3 position, float3 centerA, float3 centerB, float radius)
+{
+    float3 ba = centerB - centerA;
+    float3 pa = position - centerA;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return (pa - h * ba) / radius;
+}
+
+void IntersectCapsule(Ray ray, inout RayHit hit, Capsule capsule)
+{
+    float3 ba = capsule.centerB - capsule.centerA;
+    float3 oa = ray.origin - capsule.centerA;
+    float baba = dot(ba, ba);
+    float bard = dot(ba, ray.direction);
+    float baoa = dot(ba, oa);
+    float rdoa = dot(ray.direction, oa);
+    float oaoa = dot(oa, oa);
+    
+    float a = baba - bard * bard;
+    float b = baba * rdoa - baoa * bard;
+    float c = baba * oaoa - baoa * baoa - capsule.radius * capsule.radius * baba;
+    float h = b * b - a * c;
+    
+    if (h >= 0.0)
+    {
+        float t = (-b - sqrt(h)) / a;
+        float y = baoa + t * bard;
+        if (y > 0.0 && y < baba)
+        {
+            hit.distance = t;
+            hit.position = ray.origin + t * ray.direction;
+            hit.normal = CapsuleNormal(hit.position, capsule.centerA, capsule.centerB, capsule.radius);
+        }
+        else
+        {
+            float3 oc = (y <= 0.0) ? oa : ray.origin - capsule.centerB;
+            b = dot(ray.direction, oc);
+            c = dot(oc, oc) - capsule.radius * capsule.radius;
+            h = b * b - c;
+            if (h > 0.0)
+            {
+                t = -b - sqrt(h);
+                hit.distance = t;
+                hit.position = ray.origin + t * ray.direction;
+                hit.normal = CapsuleNormal(hit.position, capsule.centerA, capsule.centerB, capsule.radius);
+            }
+        }
+    }
+}
+
+void IntersectBox(Ray ray, inout RayHit hit, Cube cube)
+{
+    float3 ro = ray.origin;
+    float3 rd = ray.direction;
+    
+    float4x4 txx = cube.worldToLocal;
+    float4x4 txi = cube.localtoWorld;
+    float3 rad = cube.halfSize;
+    
+    // convert from ray to box space
+    float3 rdd = mul(txx, float4(rd, 0.0)).xyz;
+    float3 roo = mul(txx, float4(ro, 1.0)).xyz;
+
+	// ray-box intersection in box space
+    float3 m = 1.0 / rdd;
+    float3 k = float3(rdd.x >= 0.0 ? rad.x : -rad.x, rdd.y >= 0.0 ? rad.y : -rad.y, rdd.z >= 0.0 ? rad.z : -rad.z);
+    float3 t1 = (-roo - k) * m;
+    float3 t2 = (-roo + k) * m;
+
+    float tN = max(max(t1.x, t1.y), t1.z);
+    float tF = min(min(t2.x, t2.y), t2.z);
+    
+    // no intersection
+    if (!(tN > tF || tF < 0.0))
+    {
+        if (tN > 0.0)
+        {
+            hit.distance = tN;
+            hit.position = ray.origin + tN * ray.direction;
+            hit.normal = step(float3(tN, tN, tN), t1);
+        }
+        else
+        {
+            hit.distance = tF;
+            hit.position = ray.origin + tF * ray.direction;
+            hit.normal = step(float3(tF, tF, tF), t2);
+        }
+        hit.normal = mul(txi, float4(-sign(rdd) * hit.normal, 0.0)).xyz;
+    }
+}
+
+float3x3 AngleAxis3x3(float angle, float3 axis)
+{
+    float c, s;
+    sincos(angle, s, c);
+
+    float t = 1 - c;
+    float x = axis.x;
+    float y = axis.y;
+    float z = axis.z;
+
+    return float3x3(
+        t * x * x + c, t * x * y - s * z, t * x * z + s * y,
+        t * x * y + s * z, t * y * y + c, t * y * z - s * x,
+        t * x * z - s * y, t * y * z + s * x, t * z * z + c
+    );
+}
+
+static const float PI = 3.14159265359;
+
+bool _IsPerceptionOccluded;
+int _NumRay;
+
+RWStructuredBuffer<AgentGPU> _Agents;
+RWStructuredBuffer<float> _Visibility;
+RWStructuredBuffer<float> _ObstacleDistance;
+RWStructuredBuffer<float3> _ObstacleIntersectionPos;
+RWStructuredBuffer<Cube> _Cubes;
+
+//bool IsNaN(float x)
+//{
+//    return (asuint(x) & 0x7fffffff) > 0x7f800000;
+//}
+
+//float AgentForceWeight(float distance, float perceptionRadius, float radialRange, float bearingAngle, float angularRange)
+//{
+//    float radialWeight = exp(-0.5 * (distance * distance) / (radialRange * perceptionRadius * radialRange * perceptionRadius));
+//    float angularWeight = exp(-0.5 * (bearingAngle * bearingAngle) / (angularRange * angularRange));
+//    return radialWeight * angularWeight;
+//}
+
+//// 'distance' is the distance between agent and the obstacle in straight front
+//// 'freeAngle' is the smallest angle that agent does not see obstacles within perception radius
+//float ObstacleForceWeight(float distance, float perceptionRadius, float radialRange, float freeAngle, float angularRange)
+//{
+//    float radialWeight = exp(-0.5 * (distance * distance) / (radialRange * perceptionRadius * radialRange * perceptionRadius));
+//    float angularWeight = exp(-0.5 * ((PI - freeAngle) * (PI - freeAngle)) / (angularRange * angularRange * PI * PI));
+//    return radialWeight * angularWeight;
+//}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    // Construct ray from agent at id.x to agent at id.y
+    float3 rayOrigin = _Agents[id.x].position;
+    float3 rayVector = _Agents[id.y].position - _Agents[id.x].position;
+    float3 rayDirection = normalize(rayVector);
+    float neighborDistance = length(rayVector);
+    
+    if (neighborDistance < _Agents[id.x].perceptionRadius && id.x != id.y)
+    {
+        Ray ray = CreateRay(rayOrigin, rayDirection);
+        uint numAgents, stride;
+        _Agents.GetDimensions(numAgents, stride);
+    
+        // Check visibility between two agents
+        _Visibility[id.x * numAgents + id.y] = 1;
+        if (_IsPerceptionOccluded)
+        {
+            for (uint i = 0; i < numAgents; i++)
+            {
+                if (i != id.x && i != id.y)
+                {
+                    float newNeighborDistance = length(_Agents[i].position - _Agents[id.x].position);
+                    if (newNeighborDistance < neighborDistance)
+                    {
+                        RayHit hit = CreateRayHit();
+        
+                        Capsule capsule;
+                        float axisHalfLength = _Agents[i].capsuleHeight / 2.0 - _Agents[i].capsuleRadius;
+                        capsule.centerA = _Agents[i].position + axisHalfLength * _Agents[i].forward;
+                        capsule.centerB = _Agents[i].position - axisHalfLength * _Agents[i].forward;
+                        capsule.radius = _Agents[i].capsuleRadius;
+        
+                        IntersectCapsule(ray, hit, capsule);
+        
+                        if (0 < hit.distance && hit.distance < neighborDistance)
+                        {
+                            _Visibility[id.x * numAgents + id.y] = 0;
+                        }
+                    }
+                }
+            }
+        
+            uint numObstacle, obstacleStride;
+            _Cubes.GetDimensions(numObstacle, obstacleStride);
+            for (uint o = 0; o < numObstacle; o++)
+            {
+                RayHit hit = CreateRayHit();
+                IntersectBox(ray, hit, _Cubes[o]);
+                if (0 < hit.distance && hit.distance < neighborDistance)
+                {
+                    _Visibility[id.x * numAgents + id.y] = 0;
+                }
+            }
+        }
+    }
+    
+    uint numObstacle, obstacleStride;
+    _Cubes.GetDimensions(numObstacle, obstacleStride);
+    
+    float3 obstacleAvoidanceForceLeft = float3(0, 0, 0);
+    float3 obstacleAvoidanceForceRight = float3(0, 0, 0);
+    
+    for (int a = 0; a < _NumRay; a++)
+    {
+        float angle = PI / (_NumRay - 1) * a;
+        
+        float3x3 rotationLeft = AngleAxis3x3(-angle, _Agents[id.x].up);
+        float3 rayDirectionLeft = normalize(mul(rotationLeft, normalize(_Agents[id.x].forward)));
+        Ray rayLeft = CreateRay(rayOrigin, rayDirectionLeft);
+        
+        float3x3 rotationRight = AngleAxis3x3(angle, _Agents[id.x].up);
+        float3 rayDirectionRight = normalize(mul(rotationRight, normalize(_Agents[id.x].forward)));
+        Ray rayRight = CreateRay(rayOrigin, rayDirectionRight);
+        
+        float shortestDistanceLeft = 1.#INF;
+        float shortestDistanceRight = 1.#INF;
+        for (uint o = 0; o < numObstacle; o++)
+        {
+            RayHit hitLeft = CreateRayHit();
+            IntersectBox(rayLeft, hitLeft, _Cubes[o]);
+            float distanceLeft = hitLeft.distance;
+            
+            RayHit hitRight = CreateRayHit();
+            IntersectBox(rayRight, hitRight, _Cubes[o]);
+            float distanceRight = hitRight.distance;
+            
+            if (distanceLeft > 0 && distanceLeft < shortestDistanceLeft)
+            {
+                shortestDistanceLeft = distanceLeft;
+            }
+            if (distanceRight > 0 && distanceRight < shortestDistanceRight)
+            {
+                shortestDistanceRight = distanceRight;
+            }
+        }
+        
+        if (shortestDistanceLeft < _Agents[id.x].perceptionRadius)
+        {
+            _ObstacleDistance[id.x * (2 * _NumRay) + 2 * a] = shortestDistanceLeft;
+            _ObstacleIntersectionPos[id.x * (2 * _NumRay) + 2 * a] = rayOrigin + shortestDistanceLeft * rayDirectionLeft;
+        }
+        else
+        {
+            _ObstacleDistance[id.x * (2 * _NumRay) + 2 * a] = -1;
+            _ObstacleIntersectionPos[id.x * (2 * _NumRay) + 2 * a] = rayOrigin + _Agents[id.x].perceptionRadius * rayDirectionLeft;
+        }
+        
+        if (shortestDistanceRight < _Agents[id.x].perceptionRadius)
+        {
+            _ObstacleDistance[id.x * (2 * _NumRay) + 2 * a + 1] = shortestDistanceRight;
+            _ObstacleIntersectionPos[id.x * (2 * _NumRay) + 2 * a + 1] = rayOrigin + shortestDistanceRight * rayDirectionRight;
+        }
+        else
+        {
+            _ObstacleDistance[id.x * (2 * _NumRay) + 2 * a + 1] = -1;
+            _ObstacleIntersectionPos[id.x * (2 * _NumRay) + 2 * a + 1] = rayOrigin + _Agents[id.x].perceptionRadius * rayDirectionRight;
+        }
+    }
+}

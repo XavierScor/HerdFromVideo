@@ -1,0 +1,216 @@
+#pragma kernel CSMain
+
+RWTexture2D<float4> Result;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+struct Capsule
+{
+    float3 centerA;
+    float3 centerB;
+    float radius;
+};
+
+struct Cube
+{
+    float4x4 worldToLocal;
+    float4x4 localtoWorld;
+    float3 halfSize;
+};
+
+StructuredBuffer<Capsule> _Capsules;
+StructuredBuffer<Cube> _Cubes;
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+struct RayHit
+{
+    float3 position;
+    float distance;
+    float3 normal;
+};
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = float3(0.0f, 0.0f, 0.0f);
+    hit.distance = 1.#INF;
+    hit.normal = float3(0.0f, 0.0f, 0.0f);
+    return hit;
+}
+
+void IntersectSphere(Ray ray, inout RayHit bestHit, float4 sphere)
+{
+    float3 d = ray.origin - sphere.xyz;
+    float p1 = -dot(ray.direction, d);
+    float p2sqr = p1 * p1 - dot(d, d) + sphere.w * sphere.w;
+    if (p2sqr < 0)
+        return;
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+    if (t > 0 && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - sphere.xyz);
+    }
+
+}
+
+float3 capsuleNormal(float3 position, float3 centerA, float3 centerB, float radius)
+{
+    float3 ba = centerB - centerA;
+    float3 pa = position - centerA;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return (pa - h * ba) / radius;
+}
+
+void IntersectCapsule(Ray ray, inout RayHit bestHit, Capsule capsule)
+{
+    float3 ba = capsule.centerB - capsule.centerA;
+    float3 oa = ray.origin - capsule.centerA;
+    float baba = dot(ba, ba);
+    float bard = dot(ba, ray.direction);
+    float baoa = dot(ba, oa);
+    float rdoa = dot(ray.direction, oa);
+    float oaoa = dot(oa, oa);
+    
+    float a = baba - bard * bard;
+    float b = baba * rdoa - baoa * bard;
+    float c = baba * oaoa - baoa * baoa - capsule.radius * capsule.radius * baba;
+    float h = b * b - a * c;
+    
+    if (h >= 0.0)
+    {
+        float t = (-b - sqrt(h)) / a;
+        float y = baoa + t * bard;
+        if (y > 0.0 && y < baba)
+        {
+            bestHit.distance = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = capsuleNormal(bestHit.position, capsule.centerA, capsule.centerB, capsule.radius);
+        }
+        else
+        {
+            float3 oc = (y <= 0.0) ? oa : ray.origin - capsule.centerB;
+            b = dot(ray.direction, oc);
+            c = dot(oc, oc) - capsule.radius * capsule.radius;
+            h = b * b - c;
+            if (h > 0.0)
+            {
+                t = -b - sqrt(h);
+                bestHit.distance = t;
+                bestHit.position = ray.origin + t * ray.direction;
+                bestHit.normal = capsuleNormal(bestHit.position, capsule.centerA, capsule.centerB, capsule.radius);
+            }
+        }
+    }
+}
+
+void IntersectBox(Ray ray, inout RayHit hit, Cube cube)
+{
+    float3 ro = ray.origin;
+    float3 rd = ray.direction;
+    
+    float4x4 txx = cube.worldToLocal;
+    float4x4 txi = cube.localtoWorld;
+    float3 rad = cube.halfSize;
+    
+    // convert from ray to box space
+    float3 rdd = mul(txx, float4(rd, 0.0)).xyz;
+    float3 roo = mul(txx, float4(ro, 1.0)).xyz;
+
+	// ray-box intersection in box space
+    float3 m = 1.0 / rdd;
+    float3 k = float3(rdd.x >= 0.0 ? rad.x : -rad.x, rdd.y >= 0.0 ? rad.y : -rad.y, rdd.z >= 0.0 ? rad.z : -rad.z);
+    float3 t1 = (-roo - k) * m;
+    float3 t2 = (-roo + k) * m;
+
+    float tN = max(max(t1.x, t1.y), t1.z);
+    float tF = min(min(t2.x, t2.y), t2.z);
+    
+    // no intersection
+    if (!(tN > tF || tF < 0.0))
+    {
+        if (tN > 0.0)
+        {
+            hit.distance = tN;
+            hit.position = ray.origin + tN * ray.direction;
+            hit.normal = step(float3(tN, tN, tN), t1);
+        }
+        else
+        {
+            hit.distance = tF;
+            hit.position = ray.origin + tF * ray.direction;
+            hit.normal = step(float3(tF, tF, tF), t2);
+        }
+        hit.normal = mul(txi, float4(-sign(rdd) * hit.normal, 0.0)).xyz;
+    }
+}
+
+RayHit Trace(Ray ray)
+{
+    RayHit bestHit = CreateRayHit();
+    
+    uint numCapsules, stride;
+    _Capsules.GetDimensions(numCapsules, stride);
+    for (uint i = 0; i < numCapsules; i++)
+        IntersectCapsule(ray, bestHit, _Capsules[i]);
+    
+    uint numCubes, strideCube;
+    _Cubes.GetDimensions(numCubes, strideCube);
+    for (uint o = 0; o < numCubes; o++)
+        IntersectBox(ray, bestHit, _Cubes[o]);
+    
+    return bestHit;
+}
+
+float3 Shade(inout Ray ray, RayHit hit)
+{
+    if (hit.distance < 1.#INF)
+    {
+        return hit.normal * 0.5f + 0.5f;
+    }
+    else
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    
+    return CreateRay(origin, direction);
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+    
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+    
+    Ray ray = CreateCameraRay(uv);
+    
+    RayHit hit = Trace(ray);
+    float3 result = Shade(ray, hit);
+    Result[id.xy] = float4(result, 1);
+}
